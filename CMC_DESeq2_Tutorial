@@ -442,7 +442,7 @@ resultsNames(dds)
 
 # get the results
 Res.Age <- results(dds, name=c("MT.Grouping", "MT_PD", "NonMT_PD"))
-res <- results(dds, name="condition_trt_vs_untrt")
+res <- results(dds, name="AvsB")
 # View summary of results
 summary(Res.Age)
 
