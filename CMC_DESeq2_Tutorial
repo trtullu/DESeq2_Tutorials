@@ -1,0 +1,581 @@
+
+---
+title: "CMC_DESeq2_For_Trusha"
+author: "Nickie Safarian"
+date: "11/17/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document contaning codes for bulk brain tissue RNA-Seq analysis using DESeq2 package. The Common Mind data set is downloaded directly from Synpaser. For further onformation please check the link below:
+'https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#access-to-all-calculated-values'
+
+## load the libraries
+
+```{r, echo=FALSE, message=FALSE, include=FALSE}
+
+# install.packages("synapser", repos = c("http://ran.synapse.org", "http://cran.fhcrc.org"))
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("variancePartition")
+
+```
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(synapser)
+  synLogin('shreejoy','danfelsky')
+  library(tidyverse)
+  library(data.table)
+  library(compositions)
+  library(kableExtra)
+  library(plyr)
+  library(cowplot)
+  library(FactoMineR)
+  library(factoextra)
+  library(limma)
+  library(edgeR)
+  library(variancePartition)
+  library(ggpubr)
+}) 
+
+colorArray = colors()[grep("grey|gray", colors(), invert=TRUE)]
+
+```
+
+## PARSE THE MPP & HBCC COUNTS
+
+```{r , echo=FALSE}
+
+ALL_USED_IDs = c()
+
+# Just DLPFC counts
+ALL_USED_IDs = c(ALL_USED_IDs, 'syn24172729')
+counts.MPP = fread(synGet('syn24172729')$path, data.table=FALSE)
+rownames(counts.MPP) = counts.MPP$Geneid
+counts.MPP = counts.MPP[,-c(1:6)] 
+
+# HBCC - DLFPC
+ALL_USED_IDs = c(ALL_USED_IDs, 'syn21886235')
+counts.HBCC = fread(synGet('syn21886235')$path, data.table=FALSE)
+rownames(counts.HBCC) = counts.HBCC$Geneid
+counts.HBCC = counts.HBCC[,-c(1:6)] 
+
+#Merge the cohorts
+geneCountsMerged = cbind(counts.MPP, counts.HBCC)
+
+```
+
+```{r}
+
+# save (always keep a copy of the data in your directory)
+saveRDS(geneCountsMerged, "MPP_HBCC_Counts_merged.1005.Samples.Rds")
+
+```
+
+##  Create a download function
+
+```{r Download_the_Data, cache=TRUE}
+
+downloadFile = function(id, version=NULL){
+  fread(synGet(id, version = version)$path, data.table = F)
+}
+
+```
+
+##GET ANCESTRY VECTOR USING GEMTOOLS ID
+
+```{r Get_Ancestry_Metadata_2}
+
+ANCESTRY_ID = 'syn17894713'
+ALL_USED_IDs = c(ALL_USED_IDs, ANCESTRY_ID)
+ANCESTRY.HBCC = downloadFile(ANCESTRY_ID) %>% 
+  dplyr::rename(ID = 'Genotyping_Sample_ID')
+
+ANCESTRY_ID = 'syn17346100'
+ALL_USED_IDs = c(ALL_USED_IDs, ANCESTRY_ID)
+ANCESTRY.MPP = downloadFile(ANCESTRY_ID) %>% 
+  dplyr::rename('DNA_report..Genotyping.Sample_ID' = 'Genotyping_Sample_ID')
+
+ANCESTRY = rbind(
+  ANCESTRY.HBCC[,colnames(ANCESTRY.MPP)[-2]], 
+  ANCESTRY.MPP[,colnames(ANCESTRY.MPP)[-2]]
+)
+
+```
+
+## GET GENOTYPE ID
+
+```{r}
+
+GENOTYPE_ID = "syn18358480"
+ALL_USED_IDs = c(ALL_USED_IDs, GENOTYPE_ID)
+GENOTYPE = downloadFile(GENOTYPE_ID) %>% 
+  dplyr::select(Individual_ID, `Genotyping_Sample_ID`, `Exclude`) %>% 
+  dplyr::inner_join(ANCESTRY) %>% 
+  dplyr::filter(is.na(`Exclude`))
+
+```
+
+```{r}
+
+#save
+saveRDS(GENOTYPE, "CMC_MPP_HBCC_Genotypes.964.Samples.Rds")
+
+```
+
+## Get RNASeq QCmetadata 
+
+```{r}
+
+# The CMC has two meta-data sheets
+CLINICAL_ID = "syn3354385"
+clinical = downloadFile(CLINICAL_ID)
+
+ASSAY_ID = "syn24173489"
+rnaseq = downloadFile(ASSAY_ID)
+
+metadata = right_join(
+  clinical,
+  rnaseq,
+)
+
+ALL_USED_IDs = c(ALL_USED_IDs,CLINICAL_ID, ASSAY_ID)
+
+```
+
+```{r}
+
+#save
+saveRDS(clinical, "CMC_Metadata_Clinical_1084.Samples.Rds")
+saveRDS(rnaseq, "CMC_Metadata_RNAseq_991.Samples.Rds")
+saveRDS(metadata, "CMC_Merged.clinical.RNAseq.Metadata_991.Samples.Rds")
+
+```
+
+## Choose covariates of interest in the metadata (make your metadata)
+
+```{r}
+
+metadata = metadata %>%
+  dplyr::select(
+    `Individual ID`, Institution, Cohort, `Reported Gender`, Sex, Ethnicity, 
+    `Age of Death`, `PMI (in hours)`, Dx, pH, SampleID, one_of(
+      'RIN','Brain_Region', 'Ribozero_Batch', 'Library_Batch', 
+      'Flowcell_Batch', 'Mapped_Reads', 'Intragenic_Rate','Intronic_Rate', 
+      'Intergenic_Rate','Genes_Detected', 'Expression_Profiling_Efficiency', 
+      'rRNA_Rate', 'Total_Reads', 'Percent_Aligned', 'Transcripts_Detected',
+      'Exclude?')
+  ) %>% 
+  dplyr::filter(`Brain_Region` %in% c("DLPFC"))
+# Classify ages older than 90 as "90+" 
+metadata$`Age of Death`[metadata$`Age of Death`=="90+"] = 90
+# Ensure age is numeric
+metadata$`Age of Death` = as.numeric(metadata$`Age of Death`)
+
+```
+
+
+## Merge the metadata and Genotype data columns
+
+```{r}
+
+# Merge and rename columns
+METADATA = metadata %>%
+  dplyr::left_join(GENOTYPE, by = c("Individual ID" = "Individual_ID")) %>%  
+  dplyr::rename(
+    Region = `Brain_Region`,
+    PMI = `PMI (in hours)`,
+    RIN = `RIN`,
+    ReportExclude = `Exclude?`,
+    GenotypeExclude = Exclude,
+    LibraryBatch = `Library_Batch`,
+    FlowcellBatch = `Flowcell_Batch`,
+    RibozeroBatch = `Ribozero_Batch`,
+    MappedReads = `Mapped_Reads`,
+    IntragenicRate = `Intragenic_Rate`, 
+    IntronicRate = `Intronic_Rate`, 
+    IntergenicRate = `Intergenic_Rate`, 
+    GenesDetected = `Genes_Detected`,
+    ExpProfEfficiency = `Expression_Profiling_Efficiency`, 
+    rRNARate = `rRNA_Rate`,
+    TotalReads = `Total_Reads`, 
+    AlignmentRate = `Percent_Aligned`, 
+    TranscriptsDetected = `Transcripts_Detected`,    
+    TranscriptsDetected = `Transcripts_Detected`,    
+    Reported_Gender = `Reported Gender`,
+    AgeOfDeath = `Age of Death`,
+    IndividualID = `Individual ID`) %>%
+  dplyr::select(
+    SampleID, IndividualID, Institution, Cohort,Reported_Gender, Sex, 
+    Ethnicity, ageOfDeath, PMI, Dx, RIN, EV.1, EV.2, EV.3, EV.4, EV.5, 
+    LibraryBatch, FlowcellBatch, RibozeroBatch, MappedReads, TotalReads, 
+    GenesDetected, AlignmentRate, IntragenicRate, IntergenicRate, IntronicRate, 
+    ExpProfEfficiency, rRNARate, TranscriptsDetected, ReportExclude, 
+    GenotypeExclude, pH)
+ 
+```
+
+```{r}
+
+#save
+saveRDS(METADATA, "CMC_metadata_merged_with_Genotyping_991samples.35var.Rds")
+
+```
+
+## Data preprocessing
+### Step 1) Data subset
+```{r Preprocess the Data}
+
+# Do this to remove potential confounds
+METADATA = METADATA %>%
+  # Start filtering
+  dplyr::filter(SampleID %in% colnames(geneCountsMerged), !is.na(SampleID)) %>%
+  # Change how you consider cohort
+  dplyr::mutate(Cohort = forcats::fct_recode(Cohort,
+                                             `MSSM-Penn-Pitt` = 'MSSM-Penn-Pitt',
+                                             `NIMH-HBCC`='NIMH-HBCC')) %>%
+  # Only include Ctrl and SCZ cases
+  dplyr::filter(Dx %in% c("Control", "SCZ")) %>% # 
+  # Only include Males and Females
+  dplyr::filter(Reported_Gender %in% c("Male","Female")) %>%
+  # Only include XY and XX
+  dplyr::filter(Sex %in% c("XY","XX")) %>%
+  # Only include white and Black folk
+  dplyr::filter(Ethnicity %in% c("Caucasian","African-American"))
+
+# Rename (as "-" is misread in R)
+METADATA$Ethnicity[METADATA$Ethnicity=="African-American"] <- "African.American"
+
+# Check Dx levels
+unique(METADATA$Dx)
+
+paste("SCZ =", nrow(METADATA %>% filter(Dx == "SCZ")))
+paste("Control =", nrow(METADATA %>% filter(Dx == "Control")))
+
+# Set the factors
+METADATA$Dx = factor(METADATA$Dx, c('Control','SCZ'))
+
+```
+
+### Step2) Exclude NA values in these variables
+
+```{r}
+
+ind = METADATA$SampleID[which(METADATA$ReportExclude == 1 | METADATA$GenotypeExclude)]
+writeLines(paste('Following',length(ind),'samples are marked exclude'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind)) 
+ind = METADATA$SampleID [is.na(METADATA$Ethnicity) | is.na(METADATA$Institution) | is.na(METADATA$Dx)]
+writeLines(paste('Following', length(ind), 'counts are missing any metadata'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind)) 
+ind = METADATA$SampleID [is.na(METADATA$PMI)]
+writeLines(paste('Following', length(ind), 'counts are missing PMI'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind)) 
+ind = METADATA$SampleID [is.na(METADATA$Reported_Gender)]
+writeLines(paste('Following', length(ind), 'counts are missing gender'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind)) 
+ind = METADATA$SampleID [is.na(METADATA$ageOfDeath)]
+writeLines(paste('Following', length(ind), 'counts are missing age of death'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind))
+ind = METADATA$SampleID [is.na(METADATA$EV.1)]
+writeLines(paste('Following', length(ind), 'counts are missing ancestry information'))
+writeLines(paste(ind, collapse = ', '))
+METADATA = METADATA  %>% dplyr::filter(!(SampleID %in% ind))
+tab = table(METADATA$Individual_ID)
+
+# drop individuals who where sequenced twice here
+dropSamples = sapply( names(tab[tab > 1]), function(id){
+  idx = which(METADATA$Individual_ID == id)
+  df = METADATA[idx,]
+  # remove individuals that have less then max reads
+  i = which(df$MappedReads < max(df$MappedReads))
+  rownames(METADATA)[idx[i]]
+} )
+
+#subset
+METADATA = METADATA[!(rownames(METADATA) %in% dropSamples), ]
+
+
+```
+
+### Step 3) Cell Fraction Estimates
+
+```{r Cell Fraction Estimates}
+
+# include estimated cell fractions in the METADATA
+df_cellFractions = read.table(synGet('syn22333694')$path, row.names=1)
+celFrac_ilr = ilr(df_cellFractions)
+colnames(celFrac_ilr) = paste0("cellFrac_ilr_", 1:3)
+
+METADATA = merge(METADATA, df_cellFractions, by.x = 'SampleID', by.y='row.names')
+METADATA = merge(METADATA, celFrac_ilr, by.x = 'SampleID', by.y='row.names')
+
+
+```
+
+## Constructing the DESeq2 object 
+### Step 1) Match_covariates_to_expression_data
+
+```{r}
+
+# Calculates the intersection of subsets of a probability space. 
+# intersect() compares row-wise so intersect(A,B) is a 
+# df with same rows in A and in B.
+indToRetain = intersect(unique(METADATA$SampleID), unique(colnames(geneCountsMerged)))
+geneCountsMerged = geneCountsMerged[,indToRetain]
+
+rownames(METADATA) = METADATA$SampleID
+
+```
+
+### Step2) Define Coldata & Cts
+
+```{r}
+
+coldata = METADATA 
+cts = geneCountsMerged
+
+```
+
+### Step3) Check coldata & Cts IDs are matching and in the same order
+
+```{r}
+
+# Ensure coldata and cts are in the same order
+all(rownames(coldata) == colnames(cts))
+# Ensure the same samples across cts and coldata
+all(rownames(coldata) %in% colnames(cts))
+
+```
+
+### Step 4) Scale numerical covariates in the coldata accordingly
+
+```{r}
+
+coldata$ageOfDeath = scale(coldata$ageOfDeath)
+coldata$PMI = scale(coldata$PMI)
+coldata$pH = scale(coldata$pH)
+coldata$RIN = scale(coldata$RIN)
+
+```
+
+### Step 5) Factor the categorical covariates in the coldata
+
+```{r}
+
+coldata$Ethnicity <- factor(coldata$Ethnicity, c("Caucasian","African.American"))
+coldata$Sex <- factor(coldata$Sex , c("XY","XX")) 
+
+```
+
+### Step 6) DESeq2_object design
+
+```{r}
+
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData = cts, 
+                              colData = coldata, 
+                              design = ~ Ethnicity + PMI + RIN + Sex + ageOfDeath)
+
+```
+
+```{r}
+
+# Perform pre-filtering to remove genes that are lowly expressed (at least 10 counts)
+dds <- estimateSizeFactors(dds)
+ids <- rowSums(counts(dds, normalized=TRUE) >= 10 ) >= 3 
+dds <- dds[ids, ]
+
+```
+
+```{r}
+
+saveRDS(dds, "dds_CMC.data.only.counts.more.than.10.Rds")
+
+```
+
+
+### Step 7) Ensure proper reference levels for factors 
+
+```{r}
+
+dds$Ethnicity <- relevel(dds$Ethnicity, "Caucasian")
+dds$Sex <- relevel(dds$Sex, "XY")
+dds$Dx <- relevel(dds$Dx,"Control")
+
+```
+
+### Step 8) Differential Expression
+The next step is to run the function DEseq() on our DESeq2 data set object. In this step the algorithm will perform the following:
+
+__1__Estimation of size factors
+__2__Estimation of dispersion
+__3__Negative Binomial GLM fitting and Wald statistic.
+
+```{r}
+
+dds <- DESeq(dds)
+
+```
+
+### Step9) Extracting results
+```{r}
+
+# get the names for contrasting/comparing
+resultsNames(dds) 
+
+```
+
+```{r}
+
+# get the results
+Res.Age <- results(dds, name=c("MT.Grouping", "MT_PD", "NonMT_PD"))
+res <- results(dds, name="condition_trt_vs_untrt")
+# View summary of results
+summary(Res.Age)
+
+```
+
+Note: results function automatically performs independent filtering based on the mean of normalized counts for each gene, optimizing the number of genes which will have an adjusted p value below a given FDR cutoff, alpha.
+
+```{r}
+
+#How many adjusted p-values were less than 0.05?
+sum(Res.Age$padj < 0.05, na.rm=TRUE) #17 gene
+
+#first remove NAs 
+sigs <- na.omit(Res.Age)
+
+#set the padj cutoff at 0.05
+sigs <- sigs[sigs$padj < 0.05, ]
+
+```
+
+
+### Step 10) Adding gene names
+Our result table only uses Ensembl gene IDs, but gene names may be more 
+informative. Bioconductor’s biomaRt package can help with mapping various 
+ID schemes to each other.
+```{r}
+
+sigs.df <- as.data.frame(sigs)
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+sigs.df$symbol <- mapIds(org.Hs.eg.db, keys=rownames(sigs.df), 
+                         keytype= "ENSEMBL", column= "SYMBOL" )
+
+head(sigs.df)
+
+```
+
+```{r}
+
+# Save
+write.csv(sigs.df, "DESeq2.results_for_Age.csv" )
+
+```
+
+#--------------------------------------------------------------------------------------------------------
+## Extra codes
+  
+### 1) How covariates are correlated?  
+
+```{r}
+
+num.vars <- coldata [, c(5,11:13, 18,25)]
+CovarCor = cor(num.vars, method = "pearson", use = "complete.obs")
+round(CovarCor, 2)
+
+cormat <- cor(num.vars[, -4])
+cormat %>% as.data.frame %>% mutate(var2=rownames(.)) %>%
+  pivot_longer(!var2, values_to = "value") %>%
+  ggplot(aes(x=name,y=var2,fill=abs(value),label=round(value,2))) +
+  geom_tile() + geom_label() + xlab("") + ylab("") +
+  ggtitle("Correlation matrix of our predictors") +
+  labs(fill="Correlation\n(absolute):")
+
+
+```
+  
+### 2) Plotting the single gene counts 
+
+```{r}
+
+sigs.ordered <- sigs.df[order(sigs.df$log2FoldChange, sigs$pvalue),]
+
+#we can use plotCounts fxn to compare the normalized counts
+#between treated and control groups for our top 6 genes
+par(mfrow=c(2,3))
+
+plotCounts(dds, gene="ENSG00000284917", intgroup="?")
+plotCounts(dds, gene="ENSG00000288380", intgroup="?")
+plotCounts(dds, gene="ENSG00000262880", intgroup="?")
+plotCounts(dds, gene="ENSG00000284661", intgroup="?")
+plotCounts(dds, gene="ENSG00000243695", intgroup="?")
+plotCounts(dds, gene="ENSG00000278599", intgroup="?")
+
+```
+  
+```{r}
+
+G1 <- plotCounts(dds, gene="ENSG00000284917", intgroup="MT.Grouping", returnData=TRUE)
+ggplot(G1, aes(x=MT.Grouping, y=count)) + 
+  geom_boxplot(outlier.shape=NA) + 
+  geom_jitter(shape=1, colour="red", position=position_jitter(0.2)) +
+  ggtitle("ENSG00000284917/ between NMT and MT_subset data")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10),
+        axis.title=element_text(size=10,face="bold"))+
+  theme(plot.title = element_text(size = 8, face = "bold"))+
+  scale_y_log10()
+
+```
+  
+### 3) Outliers: Filtering low variance genes 
+
+```{r}
+
+# First, Normalize and transform the data in the `DESeqDataSet` object 
+dds_norm <- vst(dds, blind=FALSE) 
+
+```
+
+```{r}
+
+#plot the row-wise variance and draw a visual cutoff 
+# to exclude genes with low information content
+rv <- matrixStats::rowVars(as.matrix(assay(dds_norm)))
+rv2 <- data.frame(Seq = seq(1:nrow(dds_norm)), rowVars = rv[order(rv, decreasing = TRUE)])
+theme_set(theme_bw(base_size = 10))
+ggplot(rv2, aes(x=Seq,y=rowVars)) + geom_line() + scale_y_log10() +
+  ggtitle("vst-transformed counts ordered by rowVar")
+
+
+# concert the normalized counts to a data frame
+norm.exp.df <- as.data.frame(assays(dds_norm))#33021 genes
+norm.exp.df <- norm.exp.df[, -c(1,2)]
+
+# calculate the Median and variance per row
+norm.exp.df$q50 <- apply(norm.exp.df,1 ,quantile, probs=c(.50))
+norm.exp.df$variance = apply(norm.exp.df, 1, var)
+
+# filter the genes with variance <50th percentile across individuals
+norm.exp.filt = norm.exp.df[norm.exp.df$variance >= norm.exp.df$q50, ]
+
+```
+
+
